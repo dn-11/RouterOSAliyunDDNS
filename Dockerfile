@@ -1,17 +1,16 @@
-FROM golang:1.22-alpine3.12 as builder
+FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-ADD * /app
+ADD . .
 
-ENV GOOS=linux
 ENV CGO_ENABLED=0
+ENV GOARCH=arm64
 
-RUN cd /app && go build -o /app/main
+RUN go build -o ddns
 
-FROM alpine:3.12
+FROM --platform=linux/arm64 alpine:3.12
 
-COPY --from=builder /app/main /app/main
+COPY --from=builder /app/ddns /app/ddns
 
-CMD ["/app/main"]
-
+CMD ["/app/ddns"]
