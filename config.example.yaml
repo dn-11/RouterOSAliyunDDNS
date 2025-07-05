@@ -1,0 +1,49 @@
+interval: 60
+
+ros_client:
+  ros4:
+    host: 192.168.0.1:8728
+    user: ddns
+    password: ddns
+    interface: pppoe-out1
+    enable_v4: true
+    enable_v6: false
+  ros6:
+    host: 192.168.0.1:8728
+    user: ddns
+    password: ddns
+    interface: br-lan
+    enable_v4: false
+    enable_v6: true
+ddns_provider:
+  tencent-dual:
+    type: tencent
+    access_key_id: "111"
+    access_key_secret: "222"
+    subdomain: "home"
+    domain: "ddns.com"
+  tencent4:
+    type: tencent
+    access_key_id: "111"
+    access_key_secret: "222"
+    subdomain: "v4.home"
+    domain: "ddns.com"
+  tencent6:
+    type: tencent
+    access_key_id: "111"
+    access_key_secret: "222"
+    subdomain: "v6.home"
+    domain: "ddns.com"
+update:
+  - from: ros6
+    load_type: v6
+    to: tencent-dual
+  - from: ros6
+    load_type: v6
+    to: tencent6
+  - from: ros4
+    load_type: v4
+    to: tencent-dual
+  - from: ros4
+    load_type: v4
+    to: tencent4
