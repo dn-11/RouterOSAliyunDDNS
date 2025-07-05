@@ -1,196 +1,136 @@
 package main
 
 import (
-	"errors"
-	"flag"
-	"fmt"
-	alidns20150109 "github.com/alibabacloud-go/alidns-20150109/v4/client"
-	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
-	"github.com/alibabacloud-go/tea/tea"
-	"github.com/go-routeros/routeros/v3"
+	"awesomeProject/client/provider"
+	"awesomeProject/client/provider/aliyun"
+	"awesomeProject/client/provider/tencent"
+	"awesomeProject/client/ros"
+	"awesomeProject/config"
 	"log"
-	"net"
 	"net/netip"
-	"os"
-	"slices"
-	"strconv"
 	"time"
 )
 
 var (
-	routerOSAddr      string
-	routerOSUser      string
-	routerOSPwd       string
-	routerOSInterface string
-	accessKeyId       string
-	accessKeySecret   string
-	recordType        string
-	domain            string
-	recordKey         string
-	seconds           int
+	rosClients   = make(map[string]*ros.RouterOSClient)
+	cacheAddr    []netip.Addr
+	ddnsProvider = make(map[string]provider.DDNSProvider)
 )
 
 func main() {
-	flag.StringVar(&routerOSAddr, "rosa", os.Getenv("ROS_ADDR"), "RouterOS API Address")
-	flag.StringVar(&routerOSUser, "rosu", os.Getenv("ROS_USERNAME"), "RouterOS API Username")
-	flag.StringVar(&routerOSPwd, "rosp", os.Getenv("ROS_PASSWORD"), "RouterOS API Password")
-	flag.StringVar(&routerOSInterface, "rosi", func() string {
-		if os.Getenv("ROS_INTERFACE") != "" {
-			return os.Getenv("ROS_INTERFACE")
-		}
-		return "WAN"
-	}(), "RouterOS Interface")
-	flag.IntVar(&seconds, "i", func() int {
-		if os.Getenv("INTERVAL") != "" {
-			i, err := strconv.Atoi(os.Getenv("INTERVAL"))
-			if err == nil {
-				return i
+	// 解析配置文件
+	if err := config.Parse(); err != nil {
+		log.Fatalf("解析配置文件失败: %v", err)
+	}
+
+	log.Println("RouterOS DDNS 服务启动")
+	log.Printf("更新间隔: %d 秒", config.Conf.Interval)
+
+	// 初始化RouterOS客户端
+	for k, c := range config.Conf.RouterOSClient {
+		log.Printf("初始化 RouterOS 客户端: %s (%s)", k, c.Host)
+		rosClients[k] = ros.NewClient(c)
+	}
+
+	// 初始化DDNS提供商
+	for k, c := range config.Conf.DDNSProvider {
+		providerType := c["type"].(string)
+		log.Printf("初始化 DDNS 提供商: %s (%s)", k, providerType)
+
+		switch providerType {
+		case "aliyun":
+			client, err := aliyun.New(c["access_key_id"].(string), c["access_key_secret"].(string), c["domain"].(string), c["record_key"].(string))
+			if err != nil {
+				log.Fatalf("创建阿里云 DDNS 客户端失败: %v", err)
 			}
+			ddnsProvider[k] = client
+			log.Printf("阿里云 DDNS 客户端创建成功: %s.%s", c["record_key"].(string), c["domain"].(string))
+		case "tencent":
+			client, err := tencent.New(c)
+			if err != nil {
+				log.Fatalf("创建腾讯云 DDNS 客户端失败: %v", err)
+			}
+			ddnsProvider[k] = client
+			log.Printf("腾讯云 DDNS 客户端创建成功: %s.%s", c["subdomain"].(string), c["domain"].(string))
+		default:
+			log.Fatalf("未知的 DDNS 提供商类型: %s", providerType)
 		}
-		return 60
-	}(), "interval in seconds")
-	flag.StringVar(&accessKeyId, "ak", os.Getenv("ALIYUN_AK"), "Aliyun Access Key ID")
-	flag.StringVar(&accessKeySecret, "sk", os.Getenv("ALIYUN_SK"), "Aliyun Access Key Secret")
-	flag.StringVar(&recordType, "t", func() string {
-		if os.Getenv("RECORD_TYPE") != "" {
-			return os.Getenv("RECORD_TYPE")
-		}
-		return "A"
-	}(), "Record Type")
-	flag.StringVar(&domain, "d", os.Getenv("DOMAIN"), "Domain")
-	flag.StringVar(&recordKey, "k", os.Getenv("RECORD_KEY"), "Record Key")
-	flag.Parse()
+	}
+	cacheAddr = make([]netip.Addr, len(config.Conf.Updates))
+	log.Printf("配置了 %d 个更新任务", len(config.Conf.Updates))
 
-	Required("RouterOS Address", routerOSAddr)
-	Required("RouterOS Username", routerOSUser)
-	Required("RouterOS Password", routerOSPwd)
-	Required("RouterOS Interface", routerOSInterface)
-	Required("Aliyun Access Key ID", accessKeyId)
-	Required("Aliyun Access Key Secret", accessKeySecret)
-	Required("Domain", domain)
-	Required("Record Key", recordKey)
-
-	ticker := time.NewTicker(time.Duration(seconds) * time.Second)
+	// 立即执行一次更新
 	update()
+
+	// 设置定时器
+	ticker := time.NewTicker(time.Duration(config.Conf.Interval) * time.Second)
+	defer ticker.Stop()
+
+	log.Println("进入定时更新循环")
 	for range ticker.C {
 		update()
 	}
 }
 
-func Required(key, value string) {
-	if value == "" {
-		log.Fatalf("%s is required", key)
-	}
-}
-
 func update() {
-	hostname := fmt.Sprintf("%s.%s", recordKey, domain)
-	aliyun, err := alidns20150109.NewClient(&openapi.Config{
-		AccessKeyId:     &accessKeyId,
-		AccessKeySecret: &accessKeySecret,
-	})
-	if err != nil {
-		log.Fatalln(err)
-	}
-	ip, err := GetIpFromMitroTik()
-	if err != nil {
-		log.Println("getIpFromMitroTik failed:", err)
-		return
-	}
-	log.Printf("get current ip %s", ip.String())
+	log.Println("开始执行 DDNS 更新任务")
+	updateCount := 0
 
-	lookupIP, err := net.LookupIP(hostname)
-	if err != nil {
-		log.Println("lookupIP failed:", err)
-		return
-	}
+	for i, v := range config.Conf.Updates {
+		log.Printf("执行更新任务 %d: %s -> %s (%s)", i+1, v.From, v.To, v.LoadType)
 
-	if len(lookupIP) > 1 {
-		log.Println("too many resolves to the domain name")
-	}
+		rosClient, exists := rosClients[v.From]
+		if !exists {
+			log.Printf("错误: RouterOS 客户端 '%s' 不存在", v.From)
+			continue
+		}
 
-	if len(lookupIP) == 1 {
-		dnsip := lookupIP[0]
-		if netip.MustParseAddr(dnsip.String()) == *ip {
-			log.Println("no need to update")
-			return
+		ddnsClient, exists := ddnsProvider[v.To]
+		if !exists {
+			log.Printf("错误: DDNS 提供商 '%s' 不存在", v.To)
+			continue
+		}
+
+		var addr netip.Addr
+		var err error
+
+		switch v.LoadType {
+		case "v4":
+			log.Printf("获取 IPv4 地址: %s", v.From)
+			addr, err = rosClient.GetIpv4()
+			if err != nil {
+				log.Printf("获取 IPv4 地址失败 (%s): %v", v.From, err)
+				continue
+			}
+			log.Printf("获取到 IPv4 地址: %s (%s)", addr.String(), v.From)
+
+		case "v6":
+			log.Printf("获取 IPv6 地址: %s", v.From)
+			addr, err = rosClient.GetIpv6()
+			if err != nil {
+				log.Printf("获取 IPv6 地址失败 (%s): %v", v.From, err)
+				continue
+			}
+			log.Printf("获取到 IPv6 地址: %s (%s)", addr.String(), v.From)
+		default:
+			log.Printf("错误: 未知的地址类型: %s", v.LoadType)
+			continue
+		}
+
+		if cacheAddr[i] == addr {
+			log.Printf("地址没有变化，无需更新")
+			continue
+		}
+		cacheAddr[i] = addr
+
+		log.Printf("更新 DDNS 记录: %s -> %s", addr.String(), v.To)
+		if err := ddnsClient.Update(addr); err != nil {
+			log.Printf("更新 DDNS 记录失败 (%s): %v", v.To, err)
+		} else {
+			log.Printf("DDNS 记录更新成功: %s (%s)", addr.String(), v.To)
+			updateCount++
 		}
 	}
 
-	res, err := aliyun.DescribeDomainRecords(&alidns20150109.DescribeDomainRecordsRequest{
-		DomainName:  &domain,
-		RRKeyWord:   &recordKey,
-		TypeKeyWord: &recordType,
-	})
-	if err != nil {
-		log.Println("describeDomainRecords failed:", err)
-		return
-	}
-	records := res.Body.DomainRecords.Record
-	if len(records) < 1 {
-		log.Println("no records found")
-		res, err := aliyun.AddDomainRecord(&alidns20150109.AddDomainRecordRequest{
-			DomainName: &domain,
-			RR:         &recordKey,
-			Type:       &recordType,
-			Value:      tea.String(ip.String()),
-		})
-		if err != nil {
-			log.Println("addDomainRecord failed:", err)
-			return
-		}
-		log.Printf("add Record %s %s(%s)", *res.Body.RecordId, hostname, ip.String())
-		return
-	}
-
-	idx := slices.IndexFunc(records, func(record *alidns20150109.DescribeDomainRecordsResponseBodyDomainRecordsRecord) bool {
-		return *record.Value == ip.String()
-	})
-	if idx == -1 {
-		record := records[0]
-		_, err = aliyun.UpdateDomainRecord(&alidns20150109.UpdateDomainRecordRequest{
-			RecordId: record.RecordId,
-			RR:       &recordKey,
-			Type:     &recordType,
-			Value:    tea.String(ip.String()),
-		})
-		if err != nil {
-			log.Println("updateDomainRecord failed:", err.Error())
-			return
-		}
-		log.Printf("update Record %s %s(%s)", *record.RecordId, hostname, ip.String())
-		records = records[1:]
-	} else {
-		records = append(records[:idx], records[idx+1:]...)
-	}
-
-	for _, v := range records {
-		_, err := aliyun.DeleteDomainRecord(&alidns20150109.DeleteDomainRecordRequest{
-			RecordId: v.RecordId,
-		})
-		if err != nil {
-			log.Printf("delete record %s failed", *v.RecordId)
-		}
-	}
-}
-
-func GetIpFromMitroTik() (*netip.Addr, error) {
-	c, err := routeros.DialTimeout(routerOSAddr, routerOSUser, routerOSPwd, time.Second*20)
-	if err != nil {
-		return nil, err
-	}
-	reply, err := c.Run("/ip/address/print", "?=interface="+routerOSInterface)
-	if err != nil {
-		return nil, err
-	}
-	if len(reply.Re) != 1 {
-		return nil, errors.New("WAN interface not unique")
-	}
-	address := reply.Re[0].Map["address"]
-	prefix, err := netip.ParsePrefix(address)
-	if err != nil {
-		return nil, err
-	}
-	addr := prefix.Addr()
-	return &addr, nil
+	log.Printf("本轮更新完成，成功更新 %d/%d 个记录", updateCount, len(config.Conf.Updates))
 }

@@ -7,6 +7,9 @@ require (
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.0.10
 	github.com/alibabacloud-go/tea v1.2.2
 	github.com/go-routeros/routeros/v3 v3.0.0
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.1199
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod v1.0.1196
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
